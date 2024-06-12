@@ -1,0 +1,968 @@
+---
+title: "fish_recruits_algae_clean"
+format: html
+editor: source
+---
+
+#Set-up
+```{r Preperations}
+#| label: libraries
+#| output: false
+#| eval: true
+#| warning: false
+#| message: false
+#| cache: false
+set.seed(123)
+library(tidyverse) #for data wrangling
+library(cmdstanr)   #for cmdstan
+library(brms)       #for fitting models in STAN
+library(standist)   #for visualizing distributions
+library(HDInterval) #for HPD intervals
+library(posterior)  #for posterior draws
+library(coda)       #for diagnostics
+library(bayesplot)  #for diagnostics
+library(ggmcmc)     #for MCMC diagnostics
+library(rstan)      #for interfacing with STAN
+library(effects)   #for partial effects plots
+library(car)       #for regression diagnostics
+library(broom)     #for tidy output
+library(ggfortify) #for model diagnostics
+library(sjPlot)    #for outputs
+library(knitr)     #for kable
+library(emmeans)   #for estimating marginal means
+library(MASS)      #for glm.nb
+library(MuMIn)     #for AICc
+library(tidybayes)
+library(broom.mixed)#for tidying MCMC outputs
+library(patchwork)  #for multiple plots
+library(ggeffects)
+library(DHARMa)
+library(ggridges)
+library(bayestestR) #for ROPE
+library(see)        #for some plots
+library(easystats)     #framework for stats, modelling and visualisation 
+library(dplyr)
+library(factoextra)
+library(ggplot2)
+library(vegan)
+library(dplyr)
+library(indicspecies)
+``` 
+
+
+#Read in data
+```{r readData}
+#Read in data and convert to factors as necessary
+algae_total <- read_csv('../data/algae_total.csv', trim_ws = TRUE) 
+algae_total <- algae_total |> mutate(treatment = as.factor(treatment), 
+                           treatment_rep = as.factor(treatment_rep), 
+                           coral_species = as.factor(coral_species), 
+                           tile_rep = as.factor(tile_rep), 
+                           tile_ID_no = as.factor(tile_ID_no), 
+                           tile_ID_letter = as.factor(tile_ID_letter), 
+                           exposure = as.factor(exposure))
+
+#Make some general categories
+algae_per <- algae_total |> 
+  group_by(treatment, treatment_rep, coral_species, tile_rep, exposure) |> 
+  dplyr::reframe(coral = (coral_dead + coral_live), 
+                 other = (worm + encrusting_brown_algae), 
+                 filamentous_algae = (filamentous_algae), 
+                 turf_algae = (turf_algae), 
+                 detritus = (detritus), 
+                 bare_tile = (bare_tile), 
+                 foul_algae = (turf_algae + filamentous_algae), 
+                 fouling = (filamentous_algae + turf_algae + detritus)) |> 
+  as.data.frame()
+
+```
+
+#Detritus 
+##Run model
+###Form
+```{r}
+#| label: detritus - form
+#| output: false
+#| eval: true
+#| warning: false
+#| message: false
+#| cache: false
+
+detritus_form <- bf(detritus ~ treatment*exposure + (1|treatment_rep), 
+                    zi ~ treatment*exposure, 
+                    family = zero_inflated_negbinomial(link = "log"))  
+
+detritus_priors <- prior(normal(1.9, 1.5), class = 'Intercept') + 
+  prior(normal(0, 1.5), class = 'b') + 
+  prior(student_t(3, 0, 1.5), class = 'sd') + 
+  prior(logistic(0, 1), class = 'Intercept', dpar = 'zi') + 
+  prior(normal(0, 1), class = 'b', dpar = 'zi') + 
+  prior(gamma(0.01, 0.01), class = 'shape')
+
+detritus_brm_b <- brm(detritus_form, 
+                 data = algae_per,
+                 prior = detritus_priors, 
+                 sample_prior = 'yes',
+                 iter = 5000, 
+                 warmup = 2500, 
+                 chains = 3, cores = 3, 
+                 thin = 5, 
+                 control = list(adapt_delta = 0.99),
+                 refresh = 0, 
+                 seed = 123, 
+                 backend = "cmdstan") 
+
+```
+
+###Sampling diagnostics + model validation
+```{r}
+#| label: detritus - sampling diagnostics + model validation
+#| output: true
+#| eval: true
+#| warning: false
+#| message: false
+#| cache: true 
+#Conditional effects
+detritus_brm_b |> 
+  conditional_effects("treatment:exposure") |> 
+  plot(points = TRUE)
+
+#MCM sampler
+detritus_brm_b$fit |> stan_trace(inc_warmup = TRUE)
+detritus_brm_b$fit |> stan_ac() 
+detritus_brm_b$fit |> stan_rhat() 
+detritus_brm_b$fit |> stan_ess() 
+detritus_brm_b
+
+#Posterior probability checks and DHARMA residules
+detritus_brm_b |> pp_check(type = 'dens_overlay', ndraws = 200) + theme_classic()
+
+detritus_brm_b_resids <- make_brms_dharma_res(detritus_brm_b, integerResponse = FALSE)  
+wrap_elements(~testUniformity(detritus_brm_b_resids)) + 
+  wrap_elements(~plotResiduals(detritus_brm_b_resids, quantreg = TRUE)) +
+  wrap_elements(~testDispersion(detritus_brm_b_resids)) 
+```
+
+##Model investigation 
+###Model summary
+```{r}
+#| label: detritus - investigation
+#| output: true
+#| eval: true 
+#| warning: false
+#| message: false
+#| cache: true
+#Summary of model outputs 
+detritus_brm_b |> as_draws_df() |> 
+  dplyr::select(matches("^b_.*|^sd_.*")) |> 
+  dplyr::mutate(across(everything(), exp)) |> 
+  summarise_draws(median, ~HDInterval::hdi(.x, .width = 0.95), 
+                  rhat, 
+                  ess_bulk, 
+                  ess_tail, 
+                  Pl = ~mean(.x < 1), 
+                  Pg = ~mean(.x > 1)) |>
+  knitr::kable() 
+
+detritus_means <- detritus_brm_b |> 
+  emmeans(~treatment*exposure, type = 'response') |> 
+  as.data.frame()
+
+```
+
+###Pairwise comparisons
+```{r}
+#| label: detritus - pairwise comparisons
+#| output: true
+#| eval: true 
+#| warning: false
+#| message: false
+#| cache: true
+
+#Absolute difference in % cover of fouling for different treatments and exposures
+sTreat_f <- detritus_brm_b$data |> pull(treatment) |> levels()
+STreat_f <- rep(1, length(sTreat_f))
+names(STreat_f) <- sTreat_f
+
+detritus_brm_b |> emmeans(~treatment|exposure) |> 
+  gather_emmeans_draws() |>  
+  dplyr::mutate(.value = exp(.value)) |> 
+  ungroup() |>
+  group_by(exposure, .draw) |> 
+  reframe(fit = data.frame(contrast = rownames(multcomp::contrMat(n = STreat_f, type = "Tukey")), 
+                           fit = t(as.vector(.value) %*% t(multcomp::contrMat(n = STreat_f, type = "Tukey"))))) |> 
+  unnest(fit) |> 
+  group_by(contrast, exposure) |> 
+  dplyr::summarise(median_hdci(fit),
+            Pl = mean(fit<0),
+            Pg = mean(fit>0))
+
+#Absolute difference in % algae coverage within the different treatment from 0 to 1 (% at 1 minus % at 0)
+sTreat_f2 <- detritus_brm_b$data |> pull(exposure) |> levels()
+STreat_f2 <- rep(1, length(sTreat_f2))
+names(STreat_f2) <- sTreat_f2
+
+detritus_brm_b |> emmeans(~exposure|treatment) |> 
+  gather_emmeans_draws() |>  
+  dplyr::mutate(.value = exp(.value)) |> 
+  ungroup() |>
+  group_by(treatment, .draw) |> 
+  reframe(fit = data.frame(contrast = rownames(multcomp::contrMat(n = STreat_f2, type = "Tukey")), 
+                           fit = t(as.vector(.value) %*% t(multcomp::contrMat(n = STreat_f2, type = "Tukey"))))) |> 
+  unnest(fit) |> 
+  group_by(contrast, treatment) |> 
+  dplyr::summarise(median_hdci(fit),
+            Pl = mean(fit<0),
+            Pg = mean(fit>0))
+```
+
+#Filamentous 
+##Run model
+###Form 
+```{r}
+#| label: fila - form
+#| output: false
+#| eval: true
+#| warning: false
+#| message: false
+#| cache: false
+
+fila_form <- bf(filamentous_algae ~ treatment*exposure + (1|treatment_rep), 
+                    zi ~ treatment*exposure, 
+                    family = zero_inflated_negbinomial(link = "log"))  
+
+fila_priors <- prior(normal(3.2, 1.5), class = 'Intercept') + 
+  prior(normal(0, 0.5), class = 'b') + 
+  prior(student_t(3, 0, 1.5), class = 'sd') + 
+  prior(logistic(0, 1), class = 'Intercept', dpar = 'zi') + 
+  prior(normal(0, 1), class = 'b', dpar = 'zi') + 
+  prior(gamma(0.01, 0.01), class = 'shape')
+
+fila_brm_b <- brm(fila_form, 
+                 data = algae_per,
+                 prior = fila_priors, 
+                 sample_prior = 'yes',
+                 iter = 5000, 
+                 warmup = 2500, 
+                 chains = 3, cores = 3, 
+                 thin = 5, 
+                 control = list(adapt_delta = 0.99),
+                 refresh = 0, 
+                 seed = 123, 
+                 backend = "cmdstan") 
+
+```
+
+###Sampling diagnostics + model validation
+```{r}
+#| label: fila - sampling diagnostics + model validation
+#| output: true
+#| eval: true
+#| warning: false
+#| message: false
+#| cache: true 
+#Conditional effects
+fila_brm_b |> 
+  conditional_effects("treatment:exposure") |> 
+  plot(points = TRUE)
+
+#MCMC sampler checks
+fila_brm_b$fit |> stan_trace(inc_warmup = TRUE)
+fila_brm_b$fit |> stan_ac() 
+fila_brm_b$fit |> stan_rhat() 
+fila_brm_b$fit |> stan_ess() 
+fila_brm_b
+
+#Posterior probability and DHARMA residuals
+fila_brm_b |> pp_check(type = 'dens_overlay', ndraws = 200) + theme_classic()
+
+fila_brm_b_resids <- make_brms_dharma_res(fila_brm_b, integerResponse = FALSE)  
+
+wrap_elements(~testUniformity(fila_brm_b_resids)) + 
+  wrap_elements(~plotResiduals(fila_brm_b_resids, quantreg = TRUE)) +
+  wrap_elements(~testDispersion(fila_brm_b_resids)) 
+```
+
+##Model investigation 
+###Model summary
+```{r}
+#| label: fila - investigation
+#| output: true
+#| eval: true 
+#| warning: false
+#| message: false
+#| cache: true
+
+fila_brm_b |> as_draws_df() |> 
+  dplyr::select(matches("^b_.*|^sd_.*")) |> 
+  dplyr::mutate(across(everything(), exp)) |> 
+  summarise_draws(median, ~HDInterval::hdi(.x, .width = 0.95), 
+                  rhat, 
+                  ess_bulk, 
+                  ess_tail, 
+                  Pl = ~mean(.x < 1), 
+                  Pg = ~mean(.x > 1)) |>
+  knitr::kable() 
+
+fila_means <- fila_brm_b |> 
+  emmeans(~treatment*exposure, type = 'response') |> 
+  as.data.frame()
+```
+
+###Pairwise comparisons
+```{r}
+#| label: fila - pairwise comparisons
+#| output: true
+#| eval: true 
+#| warning: false
+#| message: false
+#| cache: true
+#Absolute difference in % cover of fouling for different treatments and exposures
+fila_brm_b  |> 
+  conditional_effects("treatment:exposure") |> 
+  plot(points = TRUE)
+
+sTreat_f <- fila_brm_b$data |> pull(treatment) |> levels()
+STreat_f <- rep(1, length(sTreat_f))
+names(STreat_f) <- sTreat_f
+
+                                
+fila_brm_b |> emmeans(~treatment|exposure) |> 
+  gather_emmeans_draws() |>  
+  dplyr::mutate(.value = exp(.value)) |> 
+  ungroup() |>
+  group_by(exposure, .draw) |> 
+  reframe(fit = data.frame(contrast = rownames(multcomp::contrMat(n = STreat_f, type = "Tukey")), 
+                           fit = t(as.vector(.value) %*% t(multcomp::contrMat(n = STreat_f, type = "Tukey"))))) |> 
+  unnest(fit) |> 
+  group_by(contrast, exposure) |> 
+  dplyr::summarise(median_hdci(fit),
+            Pl = mean(fit<0),
+            Pg = mean(fit>0))
+
+#Absolute difference in % algae coverage within the different treatment from 0 to 1 (% at 1 minus % at 0)
+sTreat_f2 <- fila_brm_b$data |> pull(exposure) |> levels()
+STreat_f2 <- rep(1, length(sTreat_f2))
+names(STreat_f2) <- sTreat_f2
+
+fila_brm_b |> emmeans(~exposure|treatment) |> 
+  gather_emmeans_draws() |>  
+  dplyr::mutate(.value = exp(.value)) |> 
+  ungroup() |>
+  group_by(treatment, .draw) |> 
+  reframe(fit = data.frame(contrast = rownames(multcomp::contrMat(n = STreat_f2, type = "Tukey")), 
+                           fit = t(as.vector(.value) %*% t(multcomp::contrMat(n = STreat_f2, type = "Tukey"))))) |> 
+  unnest(fit) |> 
+  group_by(contrast, treatment) |> 
+  dplyr::summarise(median_hdci(fit),
+            Pl = mean(fit<0),
+            Pg = mean(fit>0))
+```
+
+#Turf algae 
+##Run model
+###Form 
+```{r}
+#| label: turf - form
+#| output: false
+#| eval: true
+#| warning: false
+#| message: false
+#| cache: false
+
+turf_form <- bf(turf_algae ~ treatment*exposure + (1|treatment_rep), 
+                    zi ~ treatment*exposure, 
+                    family = zero_inflated_negbinomial(link = "log"))  
+
+turf_priors <- prior(normal(1.9, 2), class = 'Intercept') + 
+  prior(normal(0, 1), class = 'b') + 
+  prior(student_t(3, 0, 2), class = 'sd') + 
+  prior(logistic(0, 1), class = 'Intercept', dpar = 'zi') + 
+  prior(normal(0, 1), class = 'b', dpar = 'zi') + 
+  prior(gamma(0.01, 0.01), class = 'shape')
+
+turf_brm_b <- brm(turf_form, 
+                 data = algae_per,
+                 prior = turf_priors, 
+                 sample_prior = 'yes',
+                 iter = 5000, 
+                 warmup = 2500, 
+                 chains = 3, cores = 3, 
+                 thin = 5, 
+                 control = list(adapt_delta = 0.99),
+                 refresh = 0, 
+                 seed = 123, 
+                 backend = "cmdstan") 
+```
+
+###Sampling diagnostics + model validation
+```{r}
+#| label: turf - sampling diagnostics + model validation
+#| output: true
+#| eval: true
+#| warning: false
+#| message: false
+#| cache: true 
+#Conditional effects check
+turf_brm_b |> 
+  conditional_effects("treatment:exposure") |> 
+  plot(points = TRUE)
+
+#MCMC sampler checks
+turf_brm_b$fit |> stan_trace(inc_warmup = TRUE)
+turf_brm_b$fit |> stan_ac() 
+turf_brm_b$fit |> stan_rhat() 
+turf_brm_b$fit |> stan_ess() 
+turf_brm_b
+
+#Posterior probablity checks and DHARMA residuals
+turf_brm_b |> pp_check(type = 'dens_overlay', ndraws = 200) + theme_classic() + scale_x_continuous(limits = c(0,10))
+
+turf_brm_b_resids <- make_brms_dharma_res(turf_brm_b, integerResponse = FALSE)  
+
+wrap_elements(~testUniformity(turf_brm_b_resids)) + 
+  wrap_elements(~plotResiduals(turf_brm_b_resids, quantreg = TRUE)) +
+  wrap_elements(~testDispersion(turf_brm_b_resids)) 
+```
+
+###Model investigation 
+```{r}
+#| label: turf - investigation
+#| output: true
+#| eval: true 
+#| warning: false
+#| message: false
+#| cache: true
+load("../models/turf_brm_b.RData")
+
+turf_brm_b |> as_draws_df() |> 
+  dplyr::select(matches("^b_.*|^sd_.*")) |> 
+  dplyr::mutate(across(everything(), exp)) |> 
+  summarise_draws(median, ~HDInterval::hdi(.x, .width = 0.95), 
+                  rhat, 
+                  ess_bulk, 
+                  ess_tail, 
+                  Pl = ~mean(.x < 1), 
+                  Pg = ~mean(.x > 1)) |>
+  knitr::kable() 
+
+turf_means <- turf_brm_b |> 
+  emmeans(~treatment*exposure, type = 'response') |> 
+  as.data.frame()
+
+turf_means |> 
+  as.data.frame() |> 
+  write_csv("../outputs/turf_means.csv")
+
+```
+
+####Pairwise comparisons
+```{r}
+#| label: turf - pairwise comparisons
+#| output: true
+#| eval: true 
+#| warning: false
+#| message: false
+#| cache: true
+
+turf_brm_b  |> 
+  conditional_effects("treatment:exposure") |> 
+  plot(points = TRUE)
+
+sTreat_f <- turf_brm_b$data |> pull(treatment) |> levels()
+STreat_f <- rep(1, length(sTreat_f))
+names(STreat_f) <- sTreat_f
+
+                                
+turf_brm_b |> emmeans(~treatment|exposure) |> 
+  gather_emmeans_draws() |>  
+  dplyr::mutate(.value = exp(.value)) |> 
+  ungroup() |>
+  group_by(exposure, .draw) |> 
+  reframe(fit = data.frame(contrast = rownames(multcomp::contrMat(n = STreat_f, type = "Tukey")), 
+                           fit = t(as.vector(.value) %*% t(multcomp::contrMat(n = STreat_f, type = "Tukey"))))) |> 
+  unnest(fit) |> 
+  group_by(contrast, exposure) |> 
+  dplyr::summarise(median_hdci(fit),
+            Pl = mean(fit<0),
+            Pg = mean(fit>0))
+#Absolute difference in % cover of fouling for different treatments and exposures
+
+sTreat_f2 <- turf_brm_b$data |> pull(exposure) |> levels()
+STreat_f2 <- rep(1, length(sTreat_f2))
+names(STreat_f2) <- sTreat_f2
+
+turf_brm_b |> emmeans(~exposure|treatment) |> 
+  gather_emmeans_draws() |>  
+  dplyr::mutate(.value = exp(.value)) |> 
+  ungroup() |>
+  group_by(treatment, .draw) |> 
+  reframe(fit = data.frame(contrast = rownames(multcomp::contrMat(n = STreat_f2, type = "Tukey")), 
+                           fit = t(as.vector(.value) %*% t(multcomp::contrMat(n = STreat_f2, type = "Tukey"))))) |> 
+  unnest(fit) |> 
+  group_by(contrast, treatment) |> 
+  dplyr::summarise(median_hdci(fit),
+            Pl = mean(fit<0),
+            Pg = mean(fit>0))
+#Absolute difference in % algae coverage within the different treatment from 0 to 1 (% at 1 minus % at 0)
+
+```
+
+#Fouling 
+###Form 
+```{r}
+#| label: foul - form
+#| output: false
+#| eval: true
+#| warning: false
+#| message: false
+#| cache: false
+
+#straight to zero-inflated negative binomial, similar to filamentous and detritus
+
+foul_form <- bf(fouling ~ treatment*exposure + (1|treatment_rep), 
+                    zi ~ treatment*exposure, 
+                    family = zero_inflated_negbinomial(link = "log"))  
+
+#algae_per |> group_by(treatment, exposure) |> dplyr::summarise(log(median(fouling)), log(mad(fouling)))
+
+foul_priors <- prior(normal(3.7, 1), class = 'Intercept') + 
+  prior(normal(0, 0.5), class = 'b') + 
+  prior(student_t(3, 0, 1), class = 'sd') + 
+  prior(logistic(0, 1), class = 'Intercept', dpar = 'zi') + 
+  prior(normal(0, 1), class = 'b', dpar = 'zi') + 
+  prior(gamma(0.01, 0.01), class = 'shape')
+
+foul_brm_a <- brm(foul_form, 
+                 data = algae_per,
+                 prior = foul_priors, 
+                 sample_prior = 'only',
+                 iter = 5000, 
+                 warmup = 2500, 
+                 chains = 3, cores = 3, 
+                 thin = 5, 
+                 control = list(adapt_delta = 0.99),
+                 refresh = 0, 
+                 seed = 123, 
+                 backend = "cmdstan") 
+
+foul_brm_a |> conditional_effects('treatment:exposure') |> plot(points = TRUE) 
+```
+
+###With data
+```{r}
+#| label: foul - update with data
+#| output: true
+#| eval: true
+#| warning: false
+#| message: false
+#| cache: true 
+
+foul_brm_b <- foul_brm_a |> update(sample_prior = "yes",
+                                 iter = 5000, 
+                                 warmup = 2500, 
+                                 control = list(adapt_delta  = 0.99), 
+                                 backend = "cmdstan", 
+                                 cores = 3,
+                                 refresh = 0)
+
+foul_brm_b |> 
+  conditional_effects("treatment:exposure") |> 
+  plot(points = TRUE)
+
+save(foul_brm_b, file = "../models/foul_brm_b.RData")
+load("../models/foul_brm_b.RData")
+```
+
+###Sampling diagnostics 
+```{r}
+#| label: foul - sampling diagnostics
+#| output: true
+#| eval: true
+#| warning: false
+#| message: false
+#| cache: true 
+
+foul_brm_b$fit |> stan_trace(inc_warmup = TRUE)
+foul_brm_b$fit |> stan_ac() 
+foul_brm_b$fit |> stan_rhat() 
+foul_brm_b$fit |> stan_ess() 
+foul_brm_b
+#all look OK
+```
+
+###Model validation
+```{r}
+#| label: foul - validation
+#| output: true
+#| eval: true
+#| warning: false
+#| message: false
+#| cache: true 
+
+foul_brm_b |> pp_check(type = 'dens_overlay', ndraws = 200) + theme_classic()
+
+foul_brm_b_resids <- make_brms_dharma_res(foul_brm_b, integerResponse = FALSE)  
+
+wrap_elements(~testUniformity(foul_brm_b_resids)) + 
+  wrap_elements(~plotResiduals(foul_brm_b_resids, quantreg = FALSE)) +
+  wrap_elements(~testDispersion(foul_brm_b_resids)) 
+
+#all look good
+```
+
+###Model investigation 
+```{r}
+#| label: foul - investigation
+#| output: true
+#| eval: true 
+#| warning: false
+#| message: false
+#| cache: true
+
+foul_brm_b |> as_draws_df() |> 
+  dplyr::select(matches("^b_.*|^sd_.*")) |> 
+  dplyr::mutate(across(everything(), exp)) |> 
+  summarise_draws(median, ~HDInterval::hdi(.x, .width = 0.95), 
+                  rhat, 
+                  ess_bulk, 
+                  ess_tail, 
+                  Pl = ~mean(.x < 1), 
+                  Pg = ~mean(.x > 1)) |>
+  knitr::kable() 
+
+foul_means <- foul_brm_b |> 
+  emmeans(~treatment*exposure, type = 'response') |> 
+  as.data.frame()
+
+foul_means |> 
+  as.data.frame() |> 
+  write_csv("../outputs/foul_means.csv")
+
+```
+
+####Pairwise comparisons
+```{r}
+#| label: foul - pairwise comparisons
+#| output: true
+#| eval: true 
+#| warning: false
+#| message: false
+#| cache: true
+
+foul_brm_b  |> 
+  conditional_effects("treatment:exposure") |> 
+  plot(points = TRUE)
+
+sTreat_f <- foul_brm_b$data |> pull(treatment) |> levels()
+STreat_f <- rep(1, length(sTreat_f))
+names(STreat_f) <- sTreat_f
+
+                                
+foul_brm_b |> emmeans(~treatment|exposure) |> 
+  gather_emmeans_draws() |>  
+  dplyr::mutate(.value = exp(.value)) |> 
+  ungroup() |>
+  group_by(exposure, .draw) |> 
+  reframe(fit = data.frame(contrast = rownames(multcomp::contrMat(n = STreat_f, type = "Tukey")), 
+                           fit = t(as.vector(.value) %*% t(multcomp::contrMat(n = STreat_f, type = "Tukey"))))) |> 
+  unnest(fit) |> 
+  group_by(contrast, exposure) |> 
+  dplyr::summarise(median_hdci(fit),
+            Pl = mean(fit<0),
+            Pg = mean(fit>0))
+#Absolute difference in % cover of fouling for different treatments and exposures
+
+sTreat_f2 <- foul_brm_b$data |> pull(exposure) |> levels()
+STreat_f2 <- rep(1, length(sTreat_f2))
+names(STreat_f2) <- sTreat_f2
+
+foul_brm_b |> emmeans(~exposure|treatment) |> 
+  gather_emmeans_draws() |>  
+  dplyr::mutate(.value = exp(.value)) |> 
+  ungroup() |>
+  group_by(treatment, .draw) |> 
+  reframe(fit = data.frame(contrast = rownames(multcomp::contrMat(n = STreat_f2, type = "Tukey")), 
+                           fit = t(as.vector(.value) %*% t(multcomp::contrMat(n = STreat_f2, type = "Tukey"))))) |> 
+  unnest(fit) |> 
+  group_by(contrast, treatment) |> 
+  dplyr::summarise(median_hdci(fit),
+            Pl = mean(fit<0),
+            Pg = mean(fit>0))
+#Absolute difference in % algae coverage within the different treatment from 0 to 1 (% at 1 minus % at 0)
+
+```
+
+### Partial effects plots 
+```{r}
+#| label: foul - PEP
+#| output: true
+#| eval: true 
+#| warning: false
+#| message: false
+#| cache: true
+
+sTreat_f2 <- foul_brm_b$data |> pull(exposure) |> levels()
+STreat_f2 <- rep(1, length(sTreat_f2))
+names(STreat_f2) <- sTreat_f2
+
+#for this distribution hdci and hdi are same, but use hdi here so is the same as the other emmeans calculated hpdis for partial effects plots
+load("../models/foul_brm_b.RData")
+
+foul_comp_hdi <- foul_brm_b |> emmeans(~exposure|treatment) |> 
+  gather_emmeans_draws() |>  
+  dplyr::mutate(.value = exp(.value)) |> 
+  ungroup() |>
+  group_by(treatment, .draw) |> 
+  reframe(fit = data.frame(contrast = rownames(multcomp::contrMat(n = STreat_f2, type = "Tukey")), 
+                           fit = t(as.vector(.value) %*% t(multcomp::contrMat(n = STreat_f2, type = "Tukey"))))) |> 
+  unnest(fit) |> 
+  group_by(contrast, treatment) |> 
+  dplyr::summarise(median_hdi(fit),
+            Pl = mean(fit<0),
+            Pg = mean(fit>0)) |> 
+  as.data.frame() |> 
+  mutate(median = y, 
+         HDI_min = ymin, 
+         HDI_max = ymax)
+
+foul_comp_hdi
+
+#make plot that displays mean and HDCI
+ggplot(foul_comp_hdi, aes(x=factor(treatment, level = recruit_fish_level_order), y = median)) +  
+  geom_pointrange(aes(ymin = HDI_min, ymax = HDI_max), 
+                  fatten = 4, 
+                  position = position_dodge(width=0.75)) + 
+  theme_classic() + 
+  theme(legend.position = "none", 
+        text = element_text(size=15),
+        axis.text.y = element_text(colour = "black"), 
+        axis.text.x = element_text(angle = 45, 
+                                   colour = "black", 
+                                   vjust =1, 
+                                   hjust = 1, 
+                                   face = "italic")) +
+  scale_x_discrete(name = "", 
+                   breaks = waiver(), 
+                   labels = recruit_fish_level_labels) + 
+  scale_y_continuous(name = "Change in fouling coverage", 
+                     limits = c(-40,20), 
+                     breaks = seq(-40, 20, 10)) + 
+  geom_hline(yintercept = 0)
+
+```
+
+#Bare tile 
+###Form 
+```{r}
+#| label: bare - form
+#| output: false
+#| eval: true
+#| warning: false
+#| message: false
+#| cache: false
+
+bare_form <- bf(bare_tile ~ treatment*exposure + (1|treatment_rep), 
+                    family = gaussian())  
+
+algae_per |> group_by(treatment, exposure) |> dplyr::summarise((median(bare_tile)), (mad(bare_tile)))
+
+bare_priors <- prior(normal(43, 20), class = 'Intercept') + 
+  prior(normal(0, 50), class = 'b') + 
+  prior(student_t(3, 0, 20), class = 'sd')
+
+bare_brm_a <- brm(bare_form, 
+                 data = algae_per,
+                 prior = bare_priors, 
+                 sample_prior = 'only',
+                 iter = 5000, 
+                 warmup = 2500, 
+                 chains = 3, cores = 3, 
+                 thin = 5, 
+                 control = list(adapt_delta = 0.99),
+                 refresh = 0, 
+                 seed = 123, 
+                 backend = "cmdstan") 
+
+bare_brm_a |> conditional_effects('treatment:exposure') |> plot(points = TRUE) 
+```
+
+###With data
+```{r}
+#| label: bare - update with data
+#| output: true
+#| eval: true
+#| warning: false
+#| message: false
+#| cache: true 
+
+bare_brm_b <- bare_brm_a |> update(sample_prior = "yes",
+                                 iter = 5000, 
+                                 warmup = 2500, 
+                                 control = list(adapt_delta  = 0.99), 
+                                 backend = "cmdstan", 
+                                 cores = 3,
+                                 refresh = 0)
+
+bare_brm_b |> 
+  conditional_effects("treatment:exposure") |> 
+  plot(points = TRUE)
+
+save(bare_brm_b, file = "../models/bare_brm_b.RData")
+load("../models/bare_brm_b.RData")
+```
+
+###Sampling diagnostics 
+```{r}
+#| label: bare - sampling diagnostics
+#| output: true
+#| eval: true
+#| warning: false
+#| message: false
+#| cache: true 
+
+bare_brm_b$fit |> stan_trace(inc_warmup = TRUE)
+bare_brm_b$fit |> stan_ac() 
+bare_brm_b$fit |> stan_rhat() 
+bare_brm_b$fit |> stan_ess() 
+bare_brm_b
+#all look OK
+```
+
+###Model validation
+```{r}
+#| label: bare - validation
+#| output: true
+#| eval: true
+#| warning: false
+#| message: false
+#| cache: true 
+
+bare_brm_b |> pp_check(type = 'dens_overlay', ndraws = 200) + theme_classic()
+bare_brm_b_resids <- make_brms_dharma_res(bare_brm_b, integerResponse = FALSE)  
+
+wrap_elements(~testUniformity(bare_brm_b_resids)) + 
+  wrap_elements(~plotResiduals(bare_brm_b_resids, quantreg = FALSE)) +
+  wrap_elements(~testDispersion(bare_brm_b_resids)) 
+
+#all look good
+```
+
+###Model investigation 
+```{r}
+#| label: bare - investigation
+#| output: true
+#| eval: true 
+#| warning: false
+#| message: false
+#| cache: true
+
+bare_brm_b |> as_draws_df() |> 
+  dplyr::select(matches("^b_.*|^sd_.*")) |> 
+  #dplyr::mutate(across(everything(), exp)) |> 
+  summarise_draws(median, ~HDInterval::hdi(.x, .width = 0.95), 
+                  rhat, 
+                  ess_bulk, 
+                  ess_tail, 
+                  Pl = ~mean(.x < 0), 
+                  Pg = ~mean(.x > 0)) |>
+  knitr::kable() 
+
+bare_means <- bare_brm_b |> 
+  emmeans(~treatment*exposure, type = 'response') |> 
+  as.data.frame()
+
+```
+
+####Pairwise comparisons
+```{r}
+#| label: bare - pairwise comparisons
+#| output: true
+#| eval: true 
+#| warning: false
+#| message: false
+#| cache: true
+
+sTreat_b <- bare_brm_b$data |> pull(treatment) |> levels()
+STreat_b <- rep(1, length(sTreat_b))
+names(STreat_b) <- sTreat_b
+
+                                
+bare_brm_b |> emmeans(~treatment|exposure) |> 
+  gather_emmeans_draws() |>  
+  dplyr::mutate(.value = (.value)) |> 
+  ungroup() |>
+  group_by(exposure, .draw) |> 
+  reframe(fit = data.frame(contrast = rownames(multcomp::contrMat(n = STreat_b, type = "Tukey")), 
+                           fit = t(as.vector(.value) %*% t(multcomp::contrMat(n = STreat_b, type = "Tukey"))))) |> 
+  unnest(fit) |> 
+  group_by(contrast, exposure) |> 
+  dplyr::summarise(median_hdci(fit),
+            Pl = mean(fit<0),
+            Pg = mean(fit>0))
+#Absolute difference in % cover of fouling for different treatments and exposures
+
+sTreat_b2 <- bare_brm_b$data |> pull(exposure) |> levels()
+STreat_b2 <- rep(1, length(sTreat_b2))
+names(STreat_b2) <- sTreat_b2
+
+bare_brm_b |> emmeans(~exposure|treatment) |> 
+  gather_emmeans_draws() |>  
+  dplyr::mutate(.value = (.value)) |> 
+  ungroup() |>
+  group_by(treatment, .draw) |> 
+  reframe(fit = data.frame(contrast = rownames(multcomp::contrMat(n = STreat_b2, type = "Tukey")), 
+                           fit = t(as.vector(.value) %*% t(multcomp::contrMat(n = STreat_b2, type = "Tukey"))))) |> 
+  unnest(fit) |> 
+  group_by(contrast, treatment) |> 
+  dplyr::summarise(median_hdci(fit),
+            Pl = mean(fit<0),
+            Pg = mean(fit>0))
+#Absolute difference in % algae coverage within the different treatment from 0 to 1 (% at 1 minus % at 0)
+
+
+sTreat_b2 <- bare_brm_b$data |> pull(exposure) |> levels()
+STreat_b2 <- rep(1, length(sTreat_b2))
+names(STreat_b2) <- sTreat_b2
+
+bare_hdi <- bare_brm_b |> emmeans(~exposure|treatment) |> 
+  gather_emmeans_draws() |>  
+  dplyr::mutate(.value = (.value)) |> 
+  ungroup() |>
+  group_by(treatment, .draw) |> 
+  reframe(fit = data.frame(contrast = rownames(multcomp::contrMat(n = STreat_b2, type = "Tukey")), 
+                           fit = t(as.vector(.value) %*% t(multcomp::contrMat(n = STreat_b2, type = "Tukey"))))) |> 
+  unnest(fit) |> 
+  group_by(contrast, treatment) |> 
+  dplyr::summarise(median_hdi(fit),
+            Pl = mean(fit<0),
+            Pg = mean(fit>0)) |> 
+  as.data.frame() |> 
+  mutate(median = y, 
+         HDI_min = ymin, 
+         HDI_max = ymax)
+
+#make plot that displays mean and HDCI
+ggplot(bare_hdi, aes(x=factor(treatment, level = recruit_fish_level_order), y = median)) +  
+  geom_pointrange(aes(ymin = HDI_min, ymax = HDI_max), 
+                  fatten = 4, 
+                  position = position_dodge(width=0.75)) + 
+  theme_classic() + 
+  theme(legend.position = "none", 
+        text = element_text(size=15),
+        axis.text.y = element_text(colour = "black"), 
+        axis.text.x = element_text(angle = 45, 
+                                   colour = "black", 
+                                   vjust =1, 
+                                   hjust = 1, 
+                                   face = "italic")) +
+  scale_x_discrete(name = "", 
+                   breaks = waiver(), 
+                   labels = recruit_fish_level_labels) + 
+  scale_y_continuous(name = "Change in bare tile coverage", 
+                     limits = c(-20,40), 
+                     breaks = seq(-20, 40, 10)) + 
+  geom_hline(yintercept = 0)
+
+```
+
