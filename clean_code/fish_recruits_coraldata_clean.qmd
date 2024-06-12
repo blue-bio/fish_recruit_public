@@ -1,0 +1,689 @@
+---
+title: "fish_recruits_coraldata_clean"
+format: html
+editor: source
+---
+
+#Load packages
+```{r Preperations}
+#| label: libraries
+#| output: false
+#| eval: true
+#| warning: false
+#| message: false
+#| cache: false
+
+library(tidyverse) #for data wrangling
+library(cmdstanr)   #for cmdstan
+library(brms)       #for fitting models in STAN
+library(standist)   #for visualizing distributions
+library(HDInterval) #for HPD intervals
+library(posterior)  #for posterior draws
+library(coda)       #for diagnostics
+library(bayesplot)  #for diagnostics
+library(ggmcmc)     #for MCMC diagnostics
+library(rstan)      #for interfacing with STAN
+library(effects)   #for partial effects plots
+library(car)       #for regression diagnostics
+library(broom)     #for tidy output
+library(ggfortify) #for model diagnostics
+library(sjPlot)    #for outputs
+library(knitr)     #for kable
+library(emmeans)   #for estimating marginal means
+library(MASS)      #for glm.nb
+library(MuMIn)     #for AICc
+library(tidybayes)
+library(broom.mixed)#for tidying MCMC outputs
+library(patchwork)  #for multiple plots
+library(ggeffects)
+library(DHARMa)
+library(ggridges)
+library(bayestestR) #for ROPE
+library(see)        #for some plots
+library(easystats)     #framework for stats, modelling and visualisation 
+library(dplyr)
+library(chkptstanr) 
+library(glmmTMB) 
+library(brew)
+library(ggpubr)
+library(ggtext)
+```
+
+#Read in data
+```{r} 
+#| label: read coral recruit data
+#| output: false
+#| eval: true
+#| warning: false
+#| message: false
+#| cache: false
+
+#read in data and make variables factors as needed
+coral <- read_csv('../data/coral_surv.csv', trim_ws = TRUE)
+coral <- coral |> mutate(treatment = factor(treatment),
+                       treatment_rep = factor(treatment_rep), 
+                       coral_species = factor(coral_species), 
+                       tile_rep = factor(tile_rep), 
+                       tile_ID_no = factor(tile_ID_no),
+                       tile_ID_letter = factor(tile_ID_letter), 
+                       recruit_age = factor(recruit_age))   
+
+#make blocking effect within the different treatments
+coral <- coral |> mutate(treament_rep_r = factor(paste(treatment,treatment_rep)))
+
+#separate data into subsets with each coral species
+coral <- coral |> dplyr::filter(coral_species %in% c("millepora", "kenti", "goniastrea")) |> droplevels()
+coral_goni <- coral |> dplyr::filter(coral_species == "goniastrea") |> droplevels() 
+coral_kenti <- coral |> dplyr::filter(coral_species == "kenti") |> droplevels()
+coral_mille <- coral |> dplyr::filter(coral_species == "millepora") |> droplevels()
+```
+
+#Acropora kenti
+##Run model
+###Form 
+```{r}
+#| label: kenti - form
+#| output: false
+#| eval: true
+#| warning: false
+#| message: false
+#| cache: false
+
+#set model formula and priors
+coral_form_kenti <- bf(dead_post | trials(1) ~ treatment*recruit_age + (1|treament_rep_r), family = binomial(link = 'logit'))
+
+coral_priors_kenti <- prior(normal(-4.6, 2.5), class = 'Intercept') + 
+  prior(normal(0, 2.5), class = 'b') + 
+  prior(student_t(3, 0, 1), class = 'sd') 
+
+#run model
+coral_brm_kenti_b <- brm(coral_form_kenti, 
+                 data = coral_kenti,
+                 prior = coral_priors_kenti, 
+                 sample_prior = 'yes',
+                 iter = 10000, 
+                 warmup = 2500, 
+                 chains = 3, cores = 3, 
+                 thin = 5, 
+                 control = list(adapt_delta = 0.99),
+                 refresh = 1000, 
+                 seed = 123, 
+                 backend = "cmdstan") 
+
+``` 
+
+###Sampling diagnostics + model validation
+```{r}
+#| label: kenti - sampling diagnostics + model validation
+#| output: true
+#| eval: true
+#| warning: false
+#| message: false
+#| cache: true 
+#check conditional effects are in reasonable limits 
+coral_brm_kenti_b |> 
+  conditional_effects("treatment:recruit_age") |> 
+  plot(points = TRUE)
+
+#MCMC sampling diagnostics 
+coral_brm_kenti_b$fit |> stan_trace(inc_warmup = TRUE)
+coral_brm_kenti_b$fit |> stan_ac() 
+coral_brm_kenti_b$fit |> stan_rhat() 
+coral_brm_kenti_b$fit |> stan_ess() 
+coral_brm_kenti_b
+
+#Posterior probability check and DHARMA residuals 
+coral_brm_kenti_b |> pp_check(type = 'dens_overlay', ndraws = 200) + theme_classic()
+coral_brm_1_kenti_resids <- make_brms_dharma_res(coral_brm_kenti_b, integerResponse = FALSE)  
+wrap_elements(~testUniformity(coral_brm_1_kenti_resids)) + 
+  wrap_elements(~plotResiduals(coral_brm_1_kenti_resids, quantreg = TRUE)) +
+  wrap_elements(~testDispersion(coral_brm_1_kenti_resids))
+```
+
+##Model Investigations 
+###Partial effects plot
+```{r}
+#| label: kenti - PEP
+#| output: true
+#| eval: true 
+#| warning: false
+#| message: false
+#| cache: true
+
+#Set treatment order and labels
+recruit_fish_level_order <- c('cbinotatus', 'sfasciatus', 'anigrofuscus', 'zscopas', 'manual', 'uncleaned') 
+recruit_fish_level_labels <- c('C. binotatus', 'S. fasciatus', 'A. nigrofuscus', 'Z. scopas', 'Manual', 'Uncleaned')
+
+#Summarise model output
+kenti_means <- coral_brm_kenti_b |> 
+  emmeans(~treatment*recruit_age, type = 'response') |> 
+  as.data.frame() 
+
+#make plot that displays mean and HDCI
+ggplot(kenti_means, aes(x=factor(treatment, level = recruit_fish_level_order), y = prob, colour = recruit_age)) +  
+  geom_pointrange(aes(ymin = lower.HPD, ymax = upper.HPD), 
+                  fatten = 4, 
+                  position = position_dodge(width=0.75)) + 
+  theme_classic() + 
+  theme(legend.position = "right", 
+        text = element_text(size=15),
+        axis.text.y = element_text(colour = "black"), 
+        axis.text.x = element_text(angle = 45, 
+                                   colour = "black", 
+                                   vjust =1, 
+                                   hjust = 1, 
+                                   face = "italic")) +
+  scale_colour_brewer(palette = "Accent", 
+                      name = "Recruit age",
+                      labels = c("1 week", "1 month")) +
+  scale_x_discrete(name = "", 
+                   breaks = waiver(), 
+                   labels = recruit_fish_level_labels) + 
+  scale_y_continuous(expression(Probability~of~mortality), 
+                     limits = c(0, 0.25), 
+                     breaks =  seq(0, 0.25, 0.05)) + 
+   ggplot2::annotate(geom = "text", 
+                    label = expression(italic("Acropora kenti")), 
+                    size = 5, 
+                    x = 1.8, 
+                    y = 0.25, 
+                    hjust = 1, 
+                    vjust = 0.5)
+```
+
+###Pairwise comparisons
+```{r}
+#| label: kenti - pairwise comparisons
+#| output: true
+#| eval: true 
+#| warning: false
+#| message: false
+#| cache: true
+
+#Compare mortality of recruits of the same age between the different treatments
+sTreat_k <- coral_brm_kenti_b$data |> pull(treatment) |> levels()
+STreat_k <- rep(1, length(sTreat_k))
+names(STreat_k) <- sTreat_k
+
+coral_brm_kenti_b |> emmeans(~treatment|recruit_age) |> 
+  gather_emmeans_draws() |>  
+  dplyr::mutate(.value = plogis(.value)) |> 
+  ungroup() |>
+  group_by(recruit_age, .draw) |> 
+  reframe(fit = data.frame(contrast = rownames(multcomp::contrMat(n = STreat_k, type = "Tukey")), 
+                           fit = t(as.vector(.value) %*% t(multcomp::contrMat(n = STreat_k, type = "Tukey"))))) |> 
+  unnest(fit) |> 
+  group_by(recruit_age, contrast) |>  
+  dplyr::summarise(median_hdci(fit),
+            Pl = mean(fit<0),
+            Pg = mean(fit>0))
+
+#Compare mortality of recruits of the same age within the different treatments
+sTreat_k2 <- coral_brm_kenti_b$data |> pull(recruit_age) |> levels()
+STreat_k2 <- rep(1, length(sTreat_k2))
+names(STreat_k2) <- sTreat_k2
+
+coral_brm_kenti_b |> emmeans(~recruit_age|treatment) |> 
+  gather_emmeans_draws() |>  
+  dplyr::mutate(.value = plogis(.value)) |> 
+  ungroup() |>
+  group_by(treatment, .draw) |> 
+  reframe(fit = data.frame(contrast = rownames(multcomp::contrMat(n = STreat_k2, type = "Tukey")), 
+                           fit = t(as.vector(.value) %*% t(multcomp::contrMat(n = STreat_k2, type = "Tukey"))))) |> 
+  unnest(fit) |> 
+  group_by(contrast, treatment) |>  
+  dplyr::summarise(median_hdci(fit),
+            Pl = mean(fit<0),
+            Pg = mean(fit>0))
+```
+
+#Acropora millepora
+##Run model
+###Form
+```{r}
+#| label: mille - form
+#| output: false
+#| eval: true
+#| warning: false
+#| message: false
+#| cache: false
+
+coral_form_mille <- bf(dead_post | trials(1) ~ treatment*recruit_age + (1|treament_rep_r), family = binomial(link = 'logit'))
+
+coral_priors_mille <- prior(normal(-4.6, 2.5), class = 'Intercept') + 
+  prior(normal(0, 2.5), class = 'b') + 
+  prior(student_t(3, 0, 1), class = 'sd') 
+
+coral_brm_mille_b <- brm(coral_form_mille, 
+                 data = coral_mille,
+                 prior = coral_priors_mille, 
+                 sample_prior = 'yes',
+                 iter = 10000, 
+                 warmup = 2500, 
+                 chains = 3, cores = 3, 
+                 thin = 5, 
+                 control = list(adapt_delta = 0.99),
+                 refresh = 500, 
+                 seed = 123, 
+                 backend = "cmdstan")  
+
+```
+
+###Sampling diagnostics + model validation 
+```{r}
+#| label: milli - sampling diagnostics + model validation
+#| output: true
+#| eval: true
+#| warning: false
+#| message: false
+#| cache: true 
+#Check conditional effects
+coral_brm_mille_b |> conditional_effects('treatment:recruit_age') |> plot(points = TRUE)  
+
+#MCM diagnostics
+coral_brm_mille_b$fit |> stan_trace(inc_warmup = TRUE)
+coral_brm_mille_b$fit |> stan_ac() 
+coral_brm_mille_b$fit |> stan_rhat() 
+coral_brm_mille_b$fit |> stan_ess() 
+coral_brm_mille_b
+
+#PP checks and DHARMA residuals
+coral_brm_mille_b_a |> pp_check(type = 'dens_overlay', ndraws = 200) + theme_classic()
+
+coral_brm_1_mille_resids <- make_brms_dharma_res(coral_brm_mille_b, integerResponse = FALSE)  
+
+wrap_elements(~testUniformity(coral_brm_1_mille_resids)) + 
+  wrap_elements(~plotResiduals(coral_brm_1_mille_resids, quantreg = TRUE)) +
+  wrap_elements(~testDispersion(coral_brm_1_mille_resids))
+```
+
+##Model investigation  
+### Partial effects plot
+```{r}
+#| label: mille - PEP
+#| output: true
+#| eval: true 
+#| warning: false
+#| message: false
+#| cache: true
+
+#Set treatment order and labels
+recruit_fish_level_order <- c('cbinotatus', 'sfasciatus', 'anigrofuscus', 'zscopas', 'manual', 'uncleaned') 
+recruit_fish_level_labels <- c('C. binotatus', 'S. fasciatus', 'A. nigrofuscus', 'Z. scopas', 'Manual', 'Uncleaned')
+
+#Summarise model output
+mille_means <- coral_brm_mille_b |> 
+  emmeans(~treatment*recruit_age, type = 'response') |> 
+  as.data.frame()
+
+#make plot that displays mean and HDCI
+ggplot(mille_means, aes(x=factor(treatment, level = recruit_fish_level_order), y = prob, colour = recruit_age)) +  
+  geom_pointrange(aes(ymin = lower.HPD, ymax = upper.HPD), 
+                  fatten = 4, 
+                  position = position_dodge(width=0.75)) + 
+  theme_classic() + 
+  theme(legend.position = "right", 
+        text = element_text(size=15),
+        axis.text.y = element_text(colour = "black"), 
+        axis.text.x = element_text(angle = 45, 
+                                   colour = "black", 
+                                   vjust =1, 
+                                   hjust = 1, 
+                                   face = "italic")) +
+  scale_colour_brewer(palette = "Accent", 
+                      name = "Recruit age",
+                      labels = c("1 week", "1 month")) +
+  scale_x_discrete(name = "", 
+                   breaks = waiver(), 
+                   labels = recruit_fish_level_labels) + 
+  scale_y_continuous(expression(Probability~of~mortality), 
+                     limits = c(0,0.10), 
+                     breaks = seq(0, 0.10, 0.02)) + 
+   ggplot2::annotate(geom = "text", 
+                    label = expression(italic("Acropora millepora")), 
+                    size = 5, 
+                    x = 2.2, 
+                    y = 0.10, 
+                    hjust = 1, 
+                    vjust = 0.5)
+
+```
+
+###Pairwise comparisons
+```{r}
+#| label: mille - pairwise comparisons
+#| output: true
+#| eval: true 
+#| warning: false
+#| message: false
+#| cache: true
+
+#Compare mortality of recruits of the same age between the different treatments
+sTreat_m <- coral_brm_mille_b$data |> pull(treatment) |> levels()
+STreat_m <- rep(1, length(sTreat_m))
+names(STreat_m) <- sTreat_m
+
+coral_brm_mille_b |> emmeans(~treatment|recruit_age) |> 
+  gather_emmeans_draws() |>  
+  dplyr::mutate(.value = plogis(.value)) |> 
+  ungroup() |>
+  group_by(recruit_age, .draw) |> 
+  reframe(fit = data.frame(contrast = rownames(multcomp::contrMat(n = STreat_m, type = "Tukey")), 
+                           fit = t(as.vector(.value) %*% t(multcomp::contrMat(n = STreat_m, type = "Tukey"))))) |> 
+  unnest(fit) |> 
+  group_by(recruit_age, contrast) |>  
+  dplyr::summarise(median_hdci(fit),
+            Pl = mean(fit<0),
+            Pg = mean(fit>0))
+
+#Compare mortality of recruits of the same age within the different treatments
+sTreat_m2 <- coral_brm_mille_b$data |> pull(recruit_age) |> levels()
+STreat_m2 <- rep(1, length(sTreat_m2))
+names(STreat_m2) <- sTreat_m2
+
+coral_brm_mille_b |> emmeans(~recruit_age|treatment) |> 
+  gather_emmeans_draws() |>  
+  dplyr::mutate(.value = plogis(.value)) |> 
+  ungroup() |>
+  group_by(treatment, .draw) |> 
+  reframe(fit = data.frame(contrast = rownames(multcomp::contrMat(n = STreat_m2, type = "Tukey")), 
+                           fit = t(as.vector(.value) %*% t(multcomp::contrMat(n = STreat_m2, type = "Tukey"))))) |> 
+  unnest(fit) |> 
+  group_by(contrast, treatment) |>  
+  dplyr::summarise(median_hdci(fit),
+            Pl = mean(fit<0),
+            Pg = mean(fit>0))
+```
+
+#Goniastrea retiformis
+##Run model
+###Form
+```{r} 
+#| label: goni - form
+#| output: false
+#| eval: true
+#| warning: false
+#| message: false
+#| cache: false
+
+#use S.fasciatus as reference group as it has both mortality and survival
+coral_goni_s <- coral_goni |> mutate(treatment = factor(treatment, levels = c('sfasciatus', 'anigrofuscus', 'cbinotatus',  'manual', 'uncleaned', 'zscopas')))  
+coral_goni_s <- coral_goni_s |> filter(!is.na(dead_post))
+#remove any NAs
+
+coral_form_goni <- bf(dead_post | trials(1) ~ treatment + (1|treament_rep_r), family = binomial(link = 'logit'))
+
+coral_priors_goni <- prior(normal(0, 1), class = 'Intercept') + 
+  prior(normal(0, 2.5), class = 'b') + 
+  prior(student_t(3, 0, 2.5), class = 'sd')   
+
+coral_brm_goni_b <- brm(coral_form_goni, 
+                 data = coral_goni_s ,
+                 prior = coral_priors_goni, 
+                 sample_prior = 'yes',
+                 iter = 10000, 
+                 warmup = 2500, 
+                 chains = 3, cores = 3, 
+                 thin = 5, 
+                 control = list(adapt_delta = 0.99),
+                 refresh = 0, 
+                 seed = 123, 
+                 backend = "cmdstan")
+
+```
+
+###Sampling diagnostics + model validation 
+```{r}  
+#| label: goni - sampling diagnostics + model validation
+#| output: false
+#| eval: true
+#| warning: false
+#| message: false
+#| cache: false 
+#Check conditional effects are within reasonable limits
+coral_brm_goni_b |> conditional_effects("treatment") |> plot(points = TRUE)
+
+#MCMC sampling diagnostics 
+coral_brm_goni_b$fit |> stan_trace(inc_warmup = TRUE)
+coral_brm_goni_b$fit |> stan_ac() 
+coral_brm_goni_b$fit |> stan_rhat() 
+coral_brm_goni_b$fit |> stan_ess() 
+coral_brm_goni_b  
+
+#Posterior probablity checks and DHARMA residuals 
+coral_brm_goni_b |> pp_check(type = 'dens_overlay', ndraws = 200) + theme_classic()
+
+coral_brm_goni_b_resids <- make_brms_dharma_res(coral_brm_goni_b, integerResponse = FALSE)  
+wrap_elements(~testUniformity(coral_brm_goni_b_resids)) + 
+  wrap_elements(~plotResiduals(coral_brm_goni_b_resids, quantreg = TRUE)) +
+  wrap_elements(~testDispersion(coral_brm_goni_b_resids))  
+```
+
+##Model investigation 
+###Partial effects plot
+```{r} 
+#| label: goni - partial effects plot 
+#| output: false
+#| eval: true
+#| warning: false
+#| message: false
+#| cache: false 
+#set treatment order and labels
+recruit_fish_level_order <- c('cbinotatus', 'sfasciatus', 'anigrofuscus', 'zscopas', 'manual', 'uncleaned') 
+recruit_fish_level_labels <- c('C. binotatus', 'S. fasciatus', 'A. nigrofuscus', 'Z. scopas', 'Manual', 'Uncleaned')
+
+#summarise model outputs and add age as a factor so colours match the other plots
+goni_means <- coral_brm_goni_b |> 
+  emmeans(~treatment, type = 'response') |> 
+  as.data.frame()
+goni_means <- goni_means |> mutate(recruit_age = "d")
+
+#make plot that displays mean and HDCI
+goni_plot <- ggplot(goni_means, aes(x=factor(treatment, level = recruit_fish_level_order), y = prob, colour = recruit_age)) +  
+  geom_pointrange(aes(ymin = lower.HPD, ymax = upper.HPD), 
+                  fatten = 4, 
+                  position = position_dodge(width=0.75)) + 
+  theme_classic() + 
+  theme(legend.position = "right", 
+        text = element_text(size=15),
+        axis.text.y = element_text(colour = "black"), 
+        axis.text.x = element_text(angle = 45, 
+                                   colour = "black", 
+                                   vjust =1, 
+                                   hjust = 1, 
+                                   face = "italic")) +
+  scale_colour_brewer(palette = "Accent", 
+                      name = "Recruit age",
+                      labels = c("1 week")) +
+  scale_x_discrete(name = "", 
+                   breaks = waiver(), 
+                   labels = recruit_fish_level_labels) + 
+  scale_y_continuous(expression(Probability~of~mortality), 
+                     limits = c(0,1.1), 
+                     breaks = seq(0, 1, 0.2)) + 
+   ggplot2::annotate(geom = "text", 
+                    label = expression(italic("Goniastrea retiformis")), 
+                    size = 5, 
+                    x = 2.4, 
+                    y = 1.1, 
+                    hjust = 1, 
+                    vjust = 0.5)
+```
+
+###Pairwise comparisons
+```{r} 
+#| label: goni - partial effects plot 
+#| output: false
+#| eval: true
+#| warning: false
+#| message: false
+#| cache: false 
+#Compare mortality of Goniastrea between the different treatments 
+#Shows absolute difference in probability of mortality
+sTreat_g <- coral_brm_goni_b$data |> pull(treatment) |> levels()
+STreat_g <- rep(1, length(sTreat_g))
+names(STreat_g) <- sTreat_g
+                                
+coral_brm_goni_b |> emmeans(~treatment) |> 
+  gather_emmeans_draws() |>  
+  dplyr::mutate(.value = plogis(.value)) |> 
+  ungroup() |>
+  group_by(.draw) |> 
+  reframe(fit = data.frame(contrast = rownames(multcomp::contrMat(n = STreat_g, type = "Tukey")), 
+                           fit = t(as.vector(.value) %*% t(multcomp::contrMat(n = STreat_g, type = "Tukey"))))) |> 
+  unnest(fit) |> 
+  group_by(contrast) |>  
+  dplyr::summarise(median_hdci(fit),
+            Pl = mean(fit<0),
+            Pg = mean(fit>0))
+```
+
+#Combine plots
+```{r}
+#Using past plots and some edits to improve readability (removing x-labels from stack plots etc) combine coral mortality plots into one figure
+
+kenti_plot <- ggplot(kenti_means, aes(x=factor(treatment, level = recruit_fish_level_order), y = prob, colour = recruit_age)) +  
+  geom_pointrange(aes(ymin = lower.HPD, ymax = upper.HPD), 
+                  fatten = 4, 
+                  position = position_dodge(width=0.75)) + 
+  theme_classic() + 
+  theme(legend.position = "none", 
+        text = element_text(size=17),
+        axis.text.y = element_text(colour = "black"), 
+        axis.text.x = element_text(angle = 45, 
+                                   colour = "black", 
+                                   vjust =1, 
+                                   hjust = 1, 
+                                   face = "italic")) +
+  scale_colour_brewer(palette = "Accent", 
+                      name = "Recruit age",
+                      labels = c("1 week", "1 month")) +
+  scale_x_discrete(name = "", 
+                   breaks = waiver(), 
+                   labels = c("","","","","","")) + 
+  scale_y_continuous(name = "",
+                     limits = c(0, 0.25), 
+                     breaks =  seq(0, 0.25, 0.05)) + 
+   ggplot2::annotate(geom = "text", 
+                    label = expression(bold("b)")~italic("Acropora kenti")), 
+                    size = 4, 
+                    x = 0.5, 
+                    y = 0.25, 
+                    hjust = 0, 
+                    vjust = 0.5)
+
+mille_plot <- ggplot(mille_means, aes(x=factor(treatment, level = recruit_fish_level_order), y = prob, colour = recruit_age)) +  
+  geom_pointrange(aes(ymin = lower.HPD, ymax = upper.HPD), 
+                  fatten = 4, 
+                  position = position_dodge(width=0.75)) + 
+  theme_classic() + 
+  theme(legend.position = "none", 
+        text = element_text(size=17),
+        axis.text.y = element_text(colour = "black"), 
+        axis.text.x = element_text(angle = 45, 
+                                   colour = "black", 
+                                   vjust =1, 
+                                   hjust = 1, 
+                                   face = "italic")) +
+  scale_colour_brewer(palette = "Accent", 
+                      name = "Recruit age",
+                      labels = c("1 week", "1 month")) +
+  scale_x_discrete(name = "", 
+                   breaks = waiver(), 
+                   labels = c("","","","","","")) + 
+  scale_y_continuous(name = "",
+                     limits = c(0, 0.10), 
+                     breaks =  seq(0, 0.10, 0.02)) + 
+   ggplot2::annotate(geom = "text", 
+                    label = expression(bold("a)")~italic("Acropora millepora")), 
+                    size = 4, 
+                    x = 0.5, 
+                    y = 0.1, 
+                    hjust = 0, 
+                    vjust = 0.5) 
+
+goni_plot <- ggplot(goni_means, aes(x=factor(treatment, level = recruit_fish_level_order), y = prob, colour = recruit_age)) +  
+  geom_pointrange(aes(ymin = lower.HPD, ymax = upper.HPD), 
+                  fatten = 4, 
+                  position = position_dodge(width=0.75)) + 
+  theme_classic() + 
+  theme(legend.position = "none", 
+        text = element_text(size=17),
+        axis.text.y = element_text(colour = "black"), 
+        axis.text.x = element_text(angle = 45, 
+                                   colour = "black", 
+                                   vjust =1, 
+                                   hjust = 1, 
+                                   face = "italic")) +
+  scale_colour_brewer(palette = "Accent", 
+                      name = "Recruit age",
+                      labels = c("1 week")) +
+  scale_x_discrete(name = "", 
+                   breaks = waiver(), 
+                   labels = recruit_fish_level_labels) + 
+  scale_y_continuous(name = "", 
+                     limits = c(0,1.1), 
+                     breaks = seq(0, 1, 0.2)) + 
+   ggplot2::annotate(geom = "text", 
+                    label = expression(bold("c)")~italic("Goniastrea retiformis")), 
+                    size = 4, 
+                    x = 0.5, 
+                    y = 1.1, 
+                    hjust = 0, 
+                    vjust = 0.8)
+
+goni_plot_nolab <- ggplot(goni_means, aes(x=factor(treatment, level = recruit_fish_level_order), y = prob, colour = recruit_age)) +  
+  geom_pointrange(aes(ymin = lower.HPD, ymax = upper.HPD), 
+                  fatten = 4, 
+                  position = position_dodge(width=0.75)) + 
+  theme_classic() + 
+  theme(legend.position = "none", 
+        text = element_text(size=17),
+        axis.text.y = element_text(colour = "black"), 
+        axis.text.x = element_text(angle = 45, 
+                                   colour = "black", 
+                                   vjust =1, 
+                                   hjust = 1, 
+                                   face = "italic")) +
+  scale_colour_brewer(palette = "Accent", 
+                      name = "Recruit age",
+                      labels = c("1 week")) +
+  scale_x_discrete(name = "", 
+                   breaks = waiver(), 
+                   labels = c("","","","","","")) + 
+  scale_y_continuous(name = "", 
+                     limits = c(0,1.1), 
+                     breaks = seq(0, 1, 0.2)) + 
+   ggplot2::annotate(geom = "text", 
+                    label = expression(bold("c)")~italic("Goniastrea retiformis")), 
+                    size = 4, 
+                    x = 0.5, 
+                    y = 1.1, 
+                    hjust = 0, 
+                    vjust = 0.8)
+
+coral_comb_plot <- ggarrange(mille_plot, 
+          kenti_plot, 
+          goni_plot, 
+          # labels = c("a)", "b)", "c)"),
+          # label.x = 0,
+          # label.y = 1,
+          ncol = 1, nrow = 3, 
+          legend = "bottom", 
+          common.legend = TRUE) 
+
+coral_comb_plot_nox <- ggarrange(mille_plot, 
+          kenti_plot, 
+          goni_plot_nolab, 
+          # labels = c("a)", "b)", "c)"),
+          # label.x = 0,
+          # label.y = 1,
+          ncol = 1, nrow = 3, 
+          legend = "bottom", 
+          common.legend = TRUE)
+
+require(grid) 
+annotate_figure(coral_comb_plot, left = textGrob("Probability of mortality", rot = 90, vjust = 1, hjust = 0, gp = gpar(cex = 1.2)))
+
+```
+
