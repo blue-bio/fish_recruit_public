@@ -5,7 +5,7 @@ editor: source
 ---
 
 #Set-up
-##Load the necessary libraries
+##Load packages
 ```{r Preperations}
 #| label: libraries
 #| output: false
@@ -47,7 +47,7 @@ library(plyr)
 library(ggimage)
 ```
 
-###Data: Grazing
+##Read in data: Grazing
 ```{r} 
 #| label: read grazing data
 #| output: false
@@ -88,7 +88,7 @@ fish_g_sum_t <- fish_g_sum_t |> mutate(treament_rep_r = factor(paste(treatment,t
 #makes a block within each treatment for each replicate tank
 ```
 
-###Data: Sizes
+##Read in data: Sizes
 ```{r} 
 #| label: read fish size data
 #| output: false
@@ -108,7 +108,7 @@ fish_size_body <- fish_size |> dplyr::filter(bite_number %in% c("1", "na"))
 
 ```
 
-###Manual data
+##Read in data: Manual cleaning
 ```{r} 
 #| label: read manual data
 #| output: false
@@ -122,10 +122,23 @@ manual <- manual |> mutate(treatment = factor(treatment),
                        coral_species = factor(coral_species), 
                        tile_rep = factor(tile_rep), 
                        cleaning_effort = factor(cleaning_effort))
-#read in manual clenaing data and make variables factors as needed
+#read in manual cleaning data and make variables factors as needed
 ```
 
-#Negaitve binomial model
+##Read in models
+```{r}
+#| label: load models
+#| output: false
+#| eval: true
+#| warning: false
+#| message: false
+#| cache: false
+#Bayesian models used in the manuscript, generated from the forms below
+load("../models/fish_graze_brm_7_b.RData")   #Fish grazing rate
+```
+
+#Fish grazing rates
+##Negaitve binomial model
 ###Run model
 ```{r}
 #| label: model 7 - form
@@ -192,8 +205,8 @@ wrap_elements(~testUniformity(fish_g_7_b.resids)) +
 
 ```
 
-#Model Investigations 
-##Partial effects plot
+##Model Investigations 
+###Partial effects plot
 ```{r}
 #| label: model 7 - partial effects plot
 #| output: true
@@ -234,8 +247,7 @@ ggplot(grazing_means_7, aes(x=factor(treatment, levels = fish_level_order), y = 
 
 ```
 
-##Pairwise comparisons
-
+###Pairwise comparisons
 ```{r}
 #| label: model 7 - pairwise comparisons
 #| output: true
@@ -296,6 +308,86 @@ fish_graze_brm_7_b |> emmeans(~tile_status|treatment) |>
 
 ```
 
+#Body size and bite-scar analysis 
+##Body size summary
+```{r} 
+#| label: size - 1
+#| output: false
+#| eval: true
+#| warning: false
+#| message: false
+#| cache: false
+
+fish_size_body |> ddply("treatment", summarise, 
+                                  tl_mean = mean(total_length), 
+                                  sw_m = mean(snout_width),
+                                  sw_sd = sd(snout_width),
+                                  sl_m = mean(snout_length),
+                                  sl_sd = sd(snout_length),
+                                  bw_m = mean(body_width), 
+                                  stl_m = mean(standard_length), 
+                                  stl_sd = sd(standard_length),
+                                  bd_m = mean(body_depth))
+```
+
+##Bite-scar size summary
+```{r} 
+#| label: size - 2
+#| output: false
+#| eval: true
+#| warning: false
+#| message: false
+#| cache: false
+
+fish_size |> group_by(treatment, treatment_rep) |> 
+  dplyr::summarise(max(snout_length), 
+         max(snout_width), 
+         mean(area),
+         sd(area),
+         count(area > 0))
+
+#overall
+fish_size |> group_by(treatment) |> 
+  dplyr::summarise(mean(area, na.rm = TRUE),
+                   sd(area, na.rm = TRUE),
+                   count(area > 0))
+
+fish_size_body |> ddply("treatment", summarise, 
+                                  tl_mean = mean(total_length), 
+                                  sw_m = mean(snout_width),
+                                  sw_sd = sd(snout_width),
+                                  sl_m = mean(snout_length),
+                                  sl_sd = sd(snout_length),
+                                  bw_m = mean(body_width), 
+                                  stl_m = mean(standard_length), 
+                                  stl_sd = sd(standard_length),
+                                  bd_m = mean(body_depth)) 
+#individual fish
+fish_size_means <- fish_size |> group_by(treatment, treatment_rep) |> 
+  dplyr::summarise(bite_area = mean(area, na.rm = TRUE),
+                   sd(area, na.rm = TRUE),
+                   count(area > 0), 
+                   sw = max(snout_width)) |> 
+  as.data.frame()
+```
+
+#Manual cleaning time
+```{r} 
+#| label: manual 
+#| output: false
+#| eval: true
+#| warning: false
+#| message: false
+#| cache: false
+#Summarise
+manual_means <- manual |> group_by(treatment_rep) |> 
+  dplyr::summarise(time = max(total_time)) |> 
+  as.data.frame()
+
+#convert to minutes
+manual_means |> dplyr::summarise(mean(time)/60, 
+                                 sd(time)/60)
+```
 
 
 

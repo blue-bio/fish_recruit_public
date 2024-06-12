@@ -4,7 +4,8 @@ format: html
 editor: source
 ---
 
-#Load packages
+#Set-up
+##Load packages
 ```{r Preperations}
 #| label: libraries
 #| output: false
@@ -49,7 +50,7 @@ library(ggpubr)
 library(ggtext)
 ```
 
-#Read in data
+##Read in data
 ```{r} 
 #| label: read coral recruit data
 #| output: false
@@ -76,6 +77,20 @@ coral <- coral |> dplyr::filter(coral_species %in% c("millepora", "kenti", "goni
 coral_goni <- coral |> dplyr::filter(coral_species == "goniastrea") |> droplevels() 
 coral_kenti <- coral |> dplyr::filter(coral_species == "kenti") |> droplevels()
 coral_mille <- coral |> dplyr::filter(coral_species == "millepora") |> droplevels()
+```
+
+##Read in models
+```{r}
+#| label: load models
+#| output: false
+#| eval: true
+#| warning: false
+#| message: false
+#| cache: false
+#Bayesian models used in the manuscript, generated from the forms below
+load("../models/coral_brm_kenti_b.RData")   #Acropora kenti
+load("../models/coral_brm_mille_b.RData")   #Acropora millepora
+load("../models/coral_brm_goni_b.RData")    #Goniastrea retiformis
 ```
 
 #Acropora kenti
