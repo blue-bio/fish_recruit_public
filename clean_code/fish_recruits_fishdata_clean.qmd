@@ -45,6 +45,8 @@ library(easystats)     #framework for stats, modelling and visualisation
 library(dplyr)
 library(plyr)
 library(ggimage)
+source('../helperFunctions.R') 
+
 ```
 
 ##Read in data: Grazing
