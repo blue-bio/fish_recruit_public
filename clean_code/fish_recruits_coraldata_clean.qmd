@@ -48,6 +48,8 @@ library(glmmTMB)
 library(brew)
 library(ggpubr)
 library(ggtext)
+source('../helperFunctions.R') 
+
 ```
 
 ##Read in data
